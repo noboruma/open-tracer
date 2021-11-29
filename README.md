@@ -26,3 +26,10 @@ cargo build
 ```bash
 cargo run --package echo --bin echo
 ```
+
+## Build statically without libc
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target=x86_64-unknown-linux-musl
+```

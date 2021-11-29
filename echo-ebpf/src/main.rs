@@ -1,52 +1,63 @@
 #![no_std]
 #![no_main]
 
-use aya_bpf::{
-    cty::c_long,
-    helpers::bpf_probe_read_user_str,
-    macros::{map, tracepoint},
-    maps::PerCpuArray,
-    programs::TracePointContext,
-};
-
-use aya_log_ebpf::info;
-
-const LOG_BUF_CAPACITY: usize = 1024;
-
-#[repr(C)]
-pub struct Buf {
-    pub buf: [u8; LOG_BUF_CAPACITY],
-}
+use aya_bpf::{cty::c_long, helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_str}, macros::{map, tracepoint}, maps::{PerCpuArray, PerfEventArray}, programs::TracePointContext};
+use echo_common::OpenEvent;
 
 #[map]
-pub static mut BUF: PerCpuArray<Buf> = PerCpuArray::with_max_entries(1, 0);
+static mut EVENTS: PerfEventArray<OpenEvent> = PerfEventArray::with_max_entries(0, 0);
+
+#[map]
+static mut BUFFER: PerCpuArray<OpenEvent> = PerCpuArray::with_max_entries(1, 0);
+
+enum SyscallType {
+    Open,
+    OpenAtX, // Identify both open_at & open_at2
+}
 
 #[tracepoint]
-pub fn echo_trace_open(ctx: TracePointContext) -> c_long {
-    match try_echo_trace_open(ctx) {
+pub fn echo_trace_openat_x(ctx: TracePointContext) -> c_long {
+    match try_echo_trace(ctx, SyscallType::OpenAtX) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_echo_trace_open(ctx: TracePointContext) -> Result<c_long, c_long> {
+#[tracepoint]
+pub fn echo_trace_open(ctx: TracePointContext) -> c_long {
+    match try_echo_trace(ctx, SyscallType::Open) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+const MAP_ACCESS_ERROR: i32= -1;
+
+unsafe fn fill_event(ctx: &TracePointContext, event: &mut OpenEvent, syscall_type: SyscallType) -> Result<(), c_long> {
     // Load the pointer to the filename. The offset value can be found running:
     // sudo cat /sys/kernel/debug/tracing/events/syscalls/sys_enter_open/format
-    const FILENAME_OFFSET: usize = 16;
-    let filename_addr: u64 = unsafe { ctx.read_at(FILENAME_OFFSET)? };
-
-    // get the map-backed buffer that we're going to use as storage for the filename
-    let buf = unsafe { BUF.get_mut(0) }.ok_or(0)?;
+    let filename_offset: usize = match syscall_type {
+        SyscallType::Open => 16,
+        SyscallType::OpenAtX => 24,
+    };
+    let filename_addr: u64 = ctx.read_at(filename_offset)?;
 
     // read the filename
-    let filename = unsafe {
-        let len = bpf_probe_read_user_str(filename_addr as *const u8, &mut buf.buf)?;
-        core::str::from_utf8_unchecked(&buf.buf[..len])
-    };
+    bpf_probe_read_str(filename_addr as *const u8, &mut event.path)?;
 
-    // log the filename
-    info!(&ctx, "open {}", filename);
+    let comm = bpf_get_current_comm()?;
+    event.comm = *(&comm as *const [i8; 16] as *mut [u8; 16]);
 
+    event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    return Ok(());
+}
+
+fn try_echo_trace(ctx: TracePointContext, syscall_type: SyscallType) -> Result<c_long, c_long> {
+    unsafe {
+        let mut event = BUFFER.get_mut(0).ok_or(MAP_ACCESS_ERROR)?;
+        fill_event(&ctx, &mut event, syscall_type)?;
+        EVENTS.output(&ctx, &event, 0)
+    }
     Ok(0)
 }
 
