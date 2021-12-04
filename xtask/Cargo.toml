@@ -8,3 +8,9 @@ edition = "2018"
 [dependencies]
 structopt = {version = "0.3", default-features = false }
 anyhow = "1"
+walkdir = "2.3.2"
+regex = "1.5"
+echo-common = { path = "../echo-common" }
+
+[env]
+MAX_KERNEL_VERSION="4.14"

@@ -1,10 +1,13 @@
+use core::fmt;
 use std::convert::{TryFrom, TryInto};
+use std::fmt::Display;
 use std::mem::size_of;
 
 use aya::maps::perf::AsyncPerfEventArray;
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use echo_common::OpenEvent;
+use regex::Regex;
 use structopt::StructOpt;
 
 use aya::programs::TracePoint;
@@ -24,8 +27,64 @@ struct Opt {
     path: String,
 }
 
+#[derive(Debug)]
+struct KernelError {
+    desc: &'static str,
+}
+
+impl std::error::Error for KernelError {}
+impl Display for KernelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Kernel error: {}", &self.desc)
+    }
+}
+
+fn extract_num(s: &str) -> Result<i32, KernelError> {
+    let num: Option<i32> = s.parse().ok();
+    return match num {
+        Some(n) => Ok(n),
+        None => Err(KernelError{desc: "Major/Minor not numeric"}),
+    };
+}
+
+fn extract_kernel_version(input: &str) -> Result<(i32, i32), KernelError> {
+    let re = Regex::new(r"([0-9]+)\.([0-9]+)").unwrap();
+    let caps = match re.captures(input) {
+        Some(s) => s,
+        None => return Err(KernelError{desc: "No version"}),
+    };
+
+    let major = match &caps.get(1) {
+        Some(s) => extract_num(s.as_str())?,
+        None => return Err(KernelError{desc: "Major retireval failed"}),
+    };
+    let minor = match &caps.get(2) {
+        Some(s) => extract_num(s.as_str())?,
+        None => return Err(KernelError{desc: "Minor retireval failed"}),
+    };
+    return Ok((major, minor))
+}
+
+fn get_kernel_version() -> Result<(i32, i32), KernelError> {
+    let res = nix::sys::utsname::uname();
+    return extract_kernel_version(res.release());
+}
+
 async fn try_main() -> Result<(), anyhow::Error> {
+    let kernel_version = get_kernel_version()?;
+    println!("Running under: {}.{}", kernel_version.0, kernel_version.1);
+
     let opt = Opt::from_args();
+
+    match extract_kernel_version(&opt.path) {
+        Ok(bpf_kernel_version) =>
+        if bpf_kernel_version.0 > kernel_version.0 {
+            println!("[Warning] Running kernel is too old");
+        } else if bpf_kernel_version.0 == kernel_version.0 && kernel_version.1 < bpf_kernel_version.1 {
+            println!("[Warning] Running kernel is too old");
+        },
+        Err(_) => println!("[Warning] No versioning associated with bpf program"),
+    }
 
     // load the eBPF code
     let mut bpf = Bpf::load_file(&opt.path)?;
