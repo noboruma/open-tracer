@@ -1,16 +1,14 @@
 #![no_std]
 #![no_main]
 
-use aya_bpf::{cty::{c_long, c_void}, helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_str, bpf_task_pt_regs, bpf_task_storage_get, bpf_timer_init, bpf_snprintf, bpf_sys_bpf, bpf_sys_close}, macros::{map, tracepoint}, maps::{PerCpuArray, PerfEventArray}, programs::TracePointContext};
-use echo_common::OpenEvent;
+use aya_bpf::{cty::c_long, helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_str}, macros::{map, tracepoint}, maps::{PerCpuArray, PerfEventArray}, programs::TracePointContext};
+use echo_common::{OpenEvent, PATH_MAX_LEN};
 
 #[map]
 static mut EVENTS: PerfEventArray<OpenEvent> = PerfEventArray::with_max_entries(0, 0);
 
 #[map]
 static mut BUFFER: PerCpuArray<OpenEvent> = PerCpuArray::with_max_entries(1, 0);
-
-pub static VERSION: &'static str = env!("MAX_KERNEL_VERSION");
 
 enum SyscallType {
     Open,
@@ -43,7 +41,8 @@ unsafe fn fill_event(ctx: &TracePointContext, event: &mut OpenEvent, syscall_typ
         SyscallType::OpenAtX => 24,
     };
     let filename_addr: u64 = ctx.read_at(filename_offset)?;
-    bpf_sys_close(0);
+
+    event.path = [0; PATH_MAX_LEN];
 
     // read the filename
     bpf_probe_read_str(filename_addr as *const u8, &mut event.path)?;
@@ -59,7 +58,7 @@ fn try_echo_trace(ctx: TracePointContext, syscall_type: SyscallType) -> Result<c
     unsafe {
         let mut event = BUFFER.get_mut(0).ok_or(MAP_ACCESS_ERROR)?;
         fill_event(&ctx, &mut event, syscall_type)?;
-        EVENTS.output(&ctx, &event, 0)
+        EVENTS.output(&ctx, &event, 0);
     }
     Ok(0)
 }

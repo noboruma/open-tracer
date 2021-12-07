@@ -1,7 +1,7 @@
 #![no_std]
 
-const PATH_MAX_LEN: usize= 4096;
-const COMM_MAX_LEN: usize= 16;
+pub const PATH_MAX_LEN: usize= 4096;
+pub const COMM_MAX_LEN: usize= 16;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -10,6 +10,8 @@ pub struct OpenEvent {
     pub comm: [u8; COMM_MAX_LEN],
     pub pid: u32,
 }
+
+pub const MAX_EVENTS : u32 = 50;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
