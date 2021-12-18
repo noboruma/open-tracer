@@ -1,26 +1,31 @@
-use file_utils::is_exe_file;
-use kernel_version::get_kernel_version;
-
+use std::collections::HashSet;
 use std::convert::{TryFrom, TryInto};
 use std::mem::size_of;
+use std::sync::Arc;
 
 use aya::maps::perf::AsyncPerfEventArray;
 use aya::util::online_cpus;
 use bytes::BytesMut;
-use echo_common::OpenEvent;
+use echo_common::{OpenEvent, PATH_MAX_LEN, COMM_MAX_LEN};
+use file_utils::is_harmful_file;
+use server::ProcessInfoCache;
 use structopt::StructOpt;
 
 use aya::programs::TracePoint;
-use aya::Bpf;
+use aya::{Bpf, include_bytes_aligned};
 use tokio::signal;
+use tokio::sync::mpsc::Receiver;
 
 mod file_utils;
 mod kernel_version;
+mod server;
 
 use crate::file_utils::cstringify;
-use crate::kernel_version::extract_kernel_version;
+use crate::kernel_version::{get_kernel_version, extract_kernel_version};
+use crate::server::{OpenFilesKernelTracer, ProcessInfo, run_server};
 
 const CHANNEL_SIZE: usize = 100;
+const CLEAN_UP_TIMER_SEC: u64 = 100;
 
 #[tokio::main]
 async fn main() {
@@ -32,7 +37,7 @@ async fn main() {
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(short, long)]
-    path: String,
+    port: String,
 }
 
 fn openevent_from(buf: &BytesMut) -> OpenEvent {
@@ -41,9 +46,9 @@ fn openevent_from(buf: &BytesMut) -> OpenEvent {
     return data;
 }
 
-fn load_bpf(opt: &Opt) ->  Result<Bpf, anyhow::Error>  {
+fn load_bpf() ->  Result<Bpf, anyhow::Error>  {
 
-    let mut bpf = Bpf::load_file(&opt.path)?;
+    let mut bpf = Bpf::load(include_bytes_aligned!(env!("OPEN_TRACER_EBPF_BIN_ABS_PATH")))?;
 
     let opentrace: &mut TracePoint = bpf.program_mut("echo_trace_open").unwrap().try_into()?;
     opentrace.load()?;
@@ -56,12 +61,12 @@ fn load_bpf(opt: &Opt) ->  Result<Bpf, anyhow::Error>  {
     return Ok(bpf);
 }
 
-fn check_kernel_version(opt: &Opt) -> Result<(), anyhow::Error> {
+fn check_kernel_version() -> Result<(), anyhow::Error> {
 
     let kernel_version = get_kernel_version()?;
     println!("Running under: {}.{}", kernel_version.0, kernel_version.1);
 
-    match extract_kernel_version(&opt.path) {
+    match extract_kernel_version(env!("OPEN_TRACER_EBPF_BIN_ABS_PATH")) {
         Ok(bpf_kernel_version) =>
             if bpf_kernel_version.0 > kernel_version.0 {
                 println!("[Warning] Running kernel is too old");
@@ -73,17 +78,11 @@ fn check_kernel_version(opt: &Opt) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn try_main() -> Result<(), anyhow::Error> {
-
-    let opt = Opt::from_args();
-
-    check_kernel_version(&opt)?;
-
-    let bpf = load_bpf(&opt)?;
+fn start_events_listeners(bpf: &Bpf) -> Result<Receiver<OpenEvent>, anyhow::Error> {
 
     let mut events_map = AsyncPerfEventArray::try_from(bpf.map_mut("EVENTS")?)?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
 
     for cpu in online_cpus()? {
         println!("Start cpu #{}", cpu);
@@ -92,7 +91,10 @@ async fn try_main() -> Result<(), anyhow::Error> {
         tokio::task::spawn(async move {
             let mut buffers = [BytesMut::with_capacity(size_of::<OpenEvent>())];
             loop {
-                let _events = buf_per_cpu.read_events(&mut buffers).await.unwrap();
+                if let Err(e) = buf_per_cpu.read_events(&mut buffers).await {
+                    println!("cpu {} stopped: {}", cpu, e);
+                    return;
+                }
                 let event = openevent_from(&buffers[0]);
 
                 if let Err(e) = tx_per_cpu.send(event).await {
@@ -102,25 +104,71 @@ async fn try_main() -> Result<(), anyhow::Error> {
             }
         });
     }
+    Ok(rx)
+}
 
+fn start_info_writer(mut rx: Receiver<OpenEvent>, process_info: Arc<ProcessInfoCache>) {
+    let process_info_mut = process_info.clone();
     tokio::task::spawn(async move {
-        println!("PROGRAM PID PATH");
-        let mut memo = std::collections::HashSet::<String>::new();
         while let Some(data) = rx.recv().await {
-            let pathname = cstringify(&data.path);
-            let comm = cstringify(&data.comm);
-            let key = pathname.clone() + &comm;
-            if !memo.insert(key) {
-                continue
+            let pidstr = format!("{}", &data.pid);
+            let comm = cstringify(&data.comm, COMM_MAX_LEN);
+            let pathname = cstringify(&data.path, PATH_MAX_LEN);
+            if !is_harmful_file(pathname.as_str()).unwrap_or(false) {
+                continue;
             }
-            match is_exe_file(pathname.as_str()) {
-                Ok(is_exe) => if is_exe {println!("{},{},{}", comm, data.pid, pathname)},
-                //Ok(is_exe) => if is_exe {println!("{0: <16}, {1: <5}, {2: <32}", comm, data.pid, pathname)},
-                //Err(e) => println!("ERROR accessing {}: {}", pathname, e),
-                Err(_) => (),
-            };
+            let mut process_info = unsafe { process_info.info.write().unwrap_unchecked() };
+            if !process_info.contains_key(&pidstr) {
+                process_info.insert(pidstr.to_owned(), ProcessInfo {
+                    command: comm,
+                    open_files: HashSet::new(),
+                });
+            }
+            let info = process_info.get_mut(&pidstr);
+            unsafe {
+                info.unwrap_unchecked().open_files.insert(pathname);
+            }
         }
     });
+
+    tokio::task::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(CLEAN_UP_TIMER_SEC)).await;
+            process_info_mut.clean_up();
+        }
+    });
+}
+
+fn start_grpc_server(opt: &Opt, mg: OpenFilesKernelTracer) -> Result<(), anyhow::Error> {
+    let addr = format!("[::1]:{}", opt.port).parse()?;
+    let mg2 = mg.clone();
+    tokio::task::spawn(async move {
+        let res = run_server(addr, mg2);
+        match res.await {
+            Ok(_) => (),
+            Err(e) => println!("{}", e),
+        }
+    });
+    Ok(())
+}
+
+async fn try_main() -> Result<(), anyhow::Error> {
+
+    let opt = Opt::from_args();
+
+    check_kernel_version()?;
+
+    let bpf = load_bpf()?;
+
+    let rx = start_events_listeners(&bpf)?;
+
+    let server = OpenFilesKernelTracer {
+        process_info: Arc::new(ProcessInfoCache::new()),
+    };
+
+    start_info_writer(rx, server.process_info.clone());
+
+    start_grpc_server(&opt, server)?;
 
     // wait for SIGINT or SIGTERM
     wait_until_terminated().await

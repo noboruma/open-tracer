@@ -10,12 +10,19 @@ aya-log = { git = "https://github.com/aya-rs/aya-log", branch="main" }
 echo-common = { path = "../echo-common", features=["userspace"] }
 anyhow = "1.0.42"
 tokio = { version = "1.2.0", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "signal", "sync"] }
+tokio-stream = "0.1"
 bytes = "1.1"
 simplelog = "0.10"
 structopt = { version = "0.3"}
 nix = "0.23.0"
 regex = "1.5"
+tonic = "0.6"
+prost = "0.9"
+uluru = "3.0.0"
 
 [[bin]]
 name = "echo"
 path = "src/main.rs"
+
+[build-dependencies]
+tonic-build = "0.6"

@@ -11,8 +11,6 @@ pub struct OpenEvent {
     pub pid: u32,
 }
 
-pub const MAX_EVENTS : u32 = 50;
-
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct KernelVersion {
