@@ -9,8 +9,9 @@ aya = { git = "https://github.com/aya-rs/aya", branch="main" }
 aya-log = { git = "https://github.com/aya-rs/aya-log", branch="main" }
 echo-common = { path = "../echo-common", features=["userspace"] }
 anyhow = "1.0.42"
+async-stream = "0.3"
 tokio = { version = "1.2.0", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "signal", "sync"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1.8", features = ["net"] }
 bytes = "1.1"
 simplelog = "0.10"
 structopt = { version = "0.3"}
@@ -18,7 +19,7 @@ nix = "0.23.0"
 regex = "1.5"
 tonic = "0.6"
 prost = "0.9"
-uluru = "3.0.0"
+futures = "0.3.19"
 
 [[bin]]
 name = "echo"

@@ -1,3 +1,4 @@
+use tokio::net::UnixListener;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 
@@ -12,10 +13,16 @@ use kernel_tracer::{PidTraceInfoRequest, TraceInfo, KernelVersion};
 use kernel_tracer::KernelInfo;
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::{Arc, RwLock, Mutex};
 
 use crate::kernel_version::{extract_kernel_version, UNKNOWN_KERNEL_VERSION};
+use crate::metrics;
+
+use self::kernel_tracer::Metrics;
+
+use crate::unix::UnixStream;
+
+use futures::TryFutureExt;
 
 const CHANNEL_SIZE: usize = 100;
 
@@ -31,13 +38,20 @@ pub struct ProcessInfo {
 
 pub struct ProcessInfoCache {
     pub info: RwLock<InfoContainer>,
-    last_accessed: Mutex<HashSet<ProcessID>>
+    last_accessed: Mutex<HashSet<ProcessID>>,
 }
 
-pub async fn run_server(addr: SocketAddr, mg: OpenFilesKernelTracer) -> Result<(), tonic::transport::Error>{
+pub async fn run_server(socket: UnixListener, mg: OpenFilesKernelTracer) -> Result<(), tonic::transport::Error>{
+
+    let incoming = async_stream::stream! {
+        loop {
+            let item = socket.accept().map_ok(|(st, _)| UnixStream(st)).await;
+            yield item;
+        }
+    };
     return Server::builder()
         .add_service(KernelTracerServer::new(mg))
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await;
 }
 
@@ -95,6 +109,7 @@ impl ProcessInfoCache {
 #[derive(Clone)]
 pub struct OpenFilesKernelTracer {
     pub process_info: Arc<ProcessInfoCache>,
+    pub metrics: Arc<metrics::Metrics>,
 }
 
 #[tonic::async_trait]
@@ -130,6 +145,13 @@ impl KernelTracer for OpenFilesKernelTracer {
                 minor: format!("{}", bpf_kernel_version.1),
                 patch: String::new(),
             })
+        }))
+    }
+
+    async fn get_metrics(&self, _: tonic::Request<kernel_tracer::Empty>) -> Result<Response<Metrics>, Status> {
+        Ok( Response::new(Metrics {
+            event_failure_count: self.metrics.get_missing(),
+            event_success_count: self.metrics.get_handled(),
         }))
     }
 }

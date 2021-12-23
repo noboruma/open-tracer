@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::convert::{TryFrom, TryInto};
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aya::maps::perf::AsyncPerfEventArray;
@@ -13,19 +14,24 @@ use structopt::StructOpt;
 
 use aya::programs::TracePoint;
 use aya::{Bpf, include_bytes_aligned};
+use tokio::net::UnixListener;
 use tokio::signal;
 use tokio::sync::mpsc::Receiver;
 
 mod file_utils;
 mod kernel_version;
 mod server;
+mod unix;
+mod metrics;
 
 use crate::file_utils::cstringify;
 use crate::kernel_version::{get_kernel_version, extract_kernel_version};
 use crate::server::{OpenFilesKernelTracer, ProcessInfo, run_server};
+use crate::metrics::Metrics;
 
 const CHANNEL_SIZE: usize = 100;
 const CLEAN_UP_TIMER_SEC: u64 = 100;
+const PERF_BUFFER_PAGE_COUNT: usize = 4096;
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +43,7 @@ async fn main() {
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(short, long)]
-    port: String,
+    socket_path: String,
 }
 
 fn openevent_from(buf: &BytesMut) -> OpenEvent {
@@ -78,7 +84,7 @@ fn check_kernel_version() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn start_events_listeners(bpf: &Bpf) -> Result<Receiver<OpenEvent>, anyhow::Error> {
+fn start_events_listeners(bpf: &Bpf, metrics: Arc<Metrics>) -> Result<Receiver<OpenEvent>, anyhow::Error> {
 
     let mut events_map = AsyncPerfEventArray::try_from(bpf.map_mut("EVENTS")?)?;
 
@@ -86,20 +92,30 @@ fn start_events_listeners(bpf: &Bpf) -> Result<Receiver<OpenEvent>, anyhow::Erro
 
     for cpu in online_cpus()? {
         println!("Start cpu #{}", cpu);
-        let mut buf_per_cpu = events_map.open(cpu, None)?;
+        let mut buf_per_cpu = events_map.open(cpu, Some(PERF_BUFFER_PAGE_COUNT))?;
         let tx_per_cpu = tx.clone();
+        let metrics_inner = metrics.clone();
         tokio::task::spawn(async move {
-            let mut buffers = [BytesMut::with_capacity(size_of::<OpenEvent>())];
+            let mut buffers = [BytesMut::with_capacity(size_of::<OpenEvent>()*5)];
             loop {
-                if let Err(e) = buf_per_cpu.read_events(&mut buffers).await {
-                    println!("cpu {} stopped: {}", cpu, e);
-                    return;
-                }
-                let event = openevent_from(&buffers[0]);
+                let events = match buf_per_cpu.read_events(&mut buffers).await {
+                    Err(e) => {
+                        println!("cpu {} stopped: {}", cpu, e);
+                        return;
+                    },
+                    Ok(events) => events
+                };
 
-                if let Err(e) = tx_per_cpu.send(event).await {
-                    println!("receiver dropped {}", e);
-                    return;
+                metrics_inner.add_missing(events.lost);
+                metrics_inner.add_handled(events.read);
+
+                for i in 0..events.read {
+                    let event = openevent_from(&buffers[i]);
+
+                    if let Err(e) = tx_per_cpu.send(event).await {
+                        println!("receiver dropped {}", e);
+                        return;
+                    }
                 }
             }
         });
@@ -114,6 +130,7 @@ fn start_info_writer(mut rx: Receiver<OpenEvent>, process_info: Arc<ProcessInfoC
             let pidstr = format!("{}", &data.pid);
             let comm = cstringify(&data.comm, COMM_MAX_LEN);
             let pathname = cstringify(&data.path, PATH_MAX_LEN);
+
             if !is_harmful_file(pathname.as_str()).unwrap_or(false) {
                 continue;
             }
@@ -140,10 +157,11 @@ fn start_info_writer(mut rx: Receiver<OpenEvent>, process_info: Arc<ProcessInfoC
 }
 
 fn start_grpc_server(opt: &Opt, mg: OpenFilesKernelTracer) -> Result<(), anyhow::Error> {
-    let addr = format!("[::1]:{}", opt.port).parse()?;
+    let path = PathBuf::from(opt.socket_path.to_owned());
+    let socket = UnixListener::bind(path)?;
     let mg2 = mg.clone();
     tokio::task::spawn(async move {
-        let res = run_server(addr, mg2);
+        let res = run_server(socket, mg2);
         match res.await {
             Ok(_) => (),
             Err(e) => println!("{}", e),
@@ -160,22 +178,30 @@ async fn try_main() -> Result<(), anyhow::Error> {
 
     let bpf = load_bpf()?;
 
-    let rx = start_events_listeners(&bpf)?;
-
     let server = OpenFilesKernelTracer {
         process_info: Arc::new(ProcessInfoCache::new()),
+        metrics: Arc::new(Metrics::new()),
     };
+
+    let rx = start_events_listeners(&bpf, server.metrics.clone())?;
 
     start_info_writer(rx, server.process_info.clone());
 
     start_grpc_server(&opt, server)?;
 
     // wait for SIGINT or SIGTERM
-    wait_until_terminated().await
+    wait_until_terminated(&opt).await
 }
 
-async fn wait_until_terminated() -> Result<(), anyhow::Error> {
+fn cleanup(opt: &Opt) {
+    if let Err(e) = std::fs::remove_file(opt.socket_path.to_owned()) {
+        println!("Socket clean up failed: {}", e);
+    }
+}
+
+async fn wait_until_terminated(opt: &Opt) -> Result<(), anyhow::Error> {
     signal::ctrl_c().await?;
     println!("Exiting...");
+    cleanup(opt);
     Ok(())
 }
