@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Metrics {
     open_missed: AtomicU64,
     open_handled: AtomicU64,
+    open_buffer_capacity: AtomicU64,
 }
 
 impl Metrics {
@@ -10,6 +11,7 @@ impl Metrics {
         return Metrics {
             open_missed: AtomicU64::new(0),
             open_handled: AtomicU64::new(0),
+            open_buffer_capacity: AtomicU64::new(0),
         };
     }
     pub fn add_missing(&self, lost: usize) {
@@ -23,5 +25,11 @@ impl Metrics {
     }
     pub fn get_handled(&self) -> u64 {
         return self.open_handled.load(Ordering::Relaxed);
+    }
+    pub fn update_buffer_capacity(&self, buffered: usize) {
+        self.open_buffer_capacity.store(buffered as u64, Ordering::Relaxed);
+    }
+    pub fn get_buffer_capacity(&self) -> u64 {
+        return self.open_buffer_capacity.load(Ordering::Relaxed);
     }
 }

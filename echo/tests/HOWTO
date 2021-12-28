@@ -1,0 +1,21 @@
+# HOW TO: Run load testing
+## Prerequisites
+
+- Install grpcurl:
+└$ go get github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
+- Run as root
+
+## Command example
+
+```
+sudo sh load_tests.sh ../../target/release/echo `which grpcurl` 10000 100
+```
+
+This command will run the load testing across 10000 files, using 100 threads (so 100 concurrent writes at max).
+
+## Result analysis
+
+Number of success indicates how many opens were caught
+Number of failures should be 0
+Buffer capacity represents internal buffers usage, it should be close to 50

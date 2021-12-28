@@ -20,6 +20,11 @@ regex = "1.5"
 tonic = "0.6"
 prost = "0.9"
 futures = "0.3.19"
+assert_cmd = "1.0.1"
+
+[dev-dependencies]
+tokio-test = "*"
+tower = "*"
 
 [[bin]]
 name = "echo"

@@ -152,6 +152,7 @@ impl KernelTracer for OpenFilesKernelTracer {
         Ok( Response::new(Metrics {
             event_failure_count: self.metrics.get_missing(),
             event_success_count: self.metrics.get_handled(),
+            ebf_buffer_capacity: self.metrics.get_buffer_capacity(),
         }))
     }
 }

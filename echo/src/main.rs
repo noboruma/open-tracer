@@ -9,6 +9,7 @@ use aya::util::online_cpus;
 use bytes::BytesMut;
 use echo_common::{OpenEvent, PATH_MAX_LEN, COMM_MAX_LEN};
 use file_utils::is_harmful_file;
+use nix::libc::_SC_PAGE_SIZE;
 use server::ProcessInfoCache;
 use structopt::StructOpt;
 
@@ -29,9 +30,10 @@ use crate::kernel_version::{get_kernel_version, extract_kernel_version};
 use crate::server::{OpenFilesKernelTracer, ProcessInfo, run_server};
 use crate::metrics::Metrics;
 
-const CHANNEL_SIZE: usize = 100;
+const CHANNEL_SIZE: usize = 50;
 const CLEAN_UP_TIMER_SEC: u64 = 100;
 const PERF_BUFFER_PAGE_COUNT: usize = 4096;
+const BUFFER_COUNT: usize = (_SC_PAGE_SIZE as usize * PERF_BUFFER_PAGE_COUNT) / size_of::<OpenEvent>();
 
 #[tokio::main]
 async fn main() {
@@ -85,7 +87,6 @@ fn check_kernel_version() -> Result<(), anyhow::Error> {
 }
 
 fn start_events_listeners(bpf: &Bpf, metrics: Arc<Metrics>) -> Result<Receiver<OpenEvent>, anyhow::Error> {
-
     let mut events_map = AsyncPerfEventArray::try_from(bpf.map_mut("EVENTS")?)?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
@@ -96,7 +97,7 @@ fn start_events_listeners(bpf: &Bpf, metrics: Arc<Metrics>) -> Result<Receiver<O
         let tx_per_cpu = tx.clone();
         let metrics_inner = metrics.clone();
         tokio::task::spawn(async move {
-            let mut buffers = [BytesMut::with_capacity(size_of::<OpenEvent>()*5)];
+            let mut buffers = [BytesMut::with_capacity(size_of::<OpenEvent>()*BUFFER_COUNT)];
             loop {
                 let events = match buf_per_cpu.read_events(&mut buffers).await {
                     Err(e) => {
@@ -117,6 +118,8 @@ fn start_events_listeners(bpf: &Bpf, metrics: Arc<Metrics>) -> Result<Receiver<O
                         return;
                     }
                 }
+
+                metrics_inner.update_buffer_capacity(tx_per_cpu.capacity());
             }
         });
     }
